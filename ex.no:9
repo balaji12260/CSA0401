@@ -1,0 +1,169 @@
+/*
+ * shm_ipc.c
+ * Demonstrates IPC using POSIX shared memory and named semaphores.
+ *
+ * Parent -> writes messages into shared memory
+ * Child  -> reads messages from shared memory
+ *
+ * Compile:
+ *   gcc -o shm_ipc shm_ipc.c -lrt -pthread
+ *
+ * Run:
+ *   ./shm_ipc
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>      // O_CREAT, O_RDWR
+#include <sys/mman.h>   // shm_open, mmap
+#include <sys/stat.h>   // mode constants
+#include <unistd.h>     // ftruncate, fork, sleep
+#include <semaphore.h>
+#include <sys/wait.h>
+#include <errno.h>
+
+#define SHM_NAME "/my_shm_example"
+#define SEM_WRITER "/my_sem_writer"
+#define SEM_READER "/my_sem_reader"
+#define MSG_SIZE 256
+#define NUM_MESSAGES 4
+
+typedef struct {
+    int finished;              // 0 = more messages, 1 = finished
+    char message[MSG_SIZE];
+} shared_data_t;
+
+void err_exit(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+int main(void) {
+    int shm_fd;
+    shared_data_t *shm_ptr = NULL;
+    sem_t *sem_writer = NULL;
+    sem_t *sem_reader = NULL;
+
+    /* 1) Create/open shared memory */
+    shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0600);
+    if (shm_fd == -1) err_exit("shm_open");
+
+    /* Size the shared memory object */
+    if (ftruncate(shm_fd, sizeof(shared_data_t)) == -1) err_exit("ftruncate");
+
+    /* Map it into address space */
+    shm_ptr = mmap(NULL, sizeof(shared_data_t), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) err_exit("mmap");
+
+    /* Initialize fields */
+    shm_ptr->finished = 0;
+    memset(shm_ptr->message, 0, MSG_SIZE);
+
+    /* 2) Create/open named semaphores for synchronization
+     * sem_writer: allows writer (parent) to write (initial 1)
+     * sem_reader: allows reader (child) to read (initial 0)
+     */
+    sem_writer = sem_open(SEM_WRITER, O_CREAT | O_EXCL, 0600, 1);
+    if (sem_writer == SEM_FAILED) {
+        if (errno == EEXIST) {
+            sem_writer = sem_open(SEM_WRITER, 0);
+            if (sem_writer == SEM_FAILED) err_exit("sem_open existing writer");
+        } else {
+            err_exit("sem_open writer");
+        }
+    }
+
+    sem_reader = sem_open(SEM_READER, O_CREAT | O_EXCL, 0600, 0);
+    if (sem_reader == SEM_FAILED) {
+        if (errno == EEXIST) {
+            sem_reader = sem_open(SEM_READER, 0);
+            if (sem_reader == SEM_FAILED) err_exit("sem_open existing reader");
+        } else {
+            err_exit("sem_open reader");
+        }
+    }
+
+    /* 3) Fork into writer (parent) and reader (child) */
+    pid_t pid = fork();
+    if (pid < 0) {
+        err_exit("fork");
+    }
+
+    if (pid == 0) {
+        /* Child process: reader */
+        while (1) {
+            /* Wait until parent posts that data is ready */
+            if (sem_wait(sem_reader) == -1) err_exit("sem_wait reader");
+
+            /* Read message */
+            printf("[Child] Received: %s\n", shm_ptr->message);
+
+            if (shm_ptr->finished) {
+                /* Allow parent to proceed with cleanup */
+                if (sem_post(sem_writer) == -1) err_exit("sem_post writer (child finish)");
+                break;
+            }
+
+            /* Indicate reader done; let writer write next message */
+            if (sem_post(sem_writer) == -1) err_exit("sem_post writer");
+
+            /* small delay to simulate processing */
+            usleep(100000);
+        }
+
+        /* Clean up child's local resources */
+        munmap(shm_ptr, sizeof(shared_data_t));
+        close(shm_fd);
+        sem_close(sem_writer);
+        sem_close(sem_reader);
+
+        exit(EXIT_SUCCESS);
+    } else {
+        /* Parent process: writer */
+        const char *messages[NUM_MESSAGES] = {
+            "Hello from parent (msg 1)",
+            "Shared memory IPC demo (msg 2)",
+            "Third message (msg 3)",
+            "END"   /* sentinel meaning "finish" */
+        };
+
+        for (int i = 0; i < NUM_MESSAGES; ++i) {
+            /* Wait until reader has consumed previous data */
+            if (sem_wait(sem_writer) == -1) err_exit("sem_wait writer");
+
+            /* Write message into shared memory */
+            strncpy(shm_ptr->message, messages[i], MSG_SIZE - 1);
+            shm_ptr->message[MSG_SIZE - 1] = '\0';
+
+            if (strcmp(messages[i], "END") == 0) {
+                shm_ptr->finished = 1;
+            } else {
+                shm_ptr->finished = 0;
+            }
+
+            /* Signal reader that data is ready */
+            if (sem_post(sem_reader) == -1) err_exit("sem_post reader");
+
+            /* Optionally wait a bit to let child process it */
+            usleep(100000);
+        }
+
+        /* Wait for child to exit */
+        wait(NULL);
+
+        /* Cleanup: unlink semaphores and shared memory */
+        sem_close(sem_writer);
+        sem_close(sem_reader);
+        sem_unlink(SEM_WRITER);
+        sem_unlink(SEM_READER);
+
+        munmap(shm_ptr, sizeof(shared_data_t));
+        close(shm_fd);
+        shm_unlink(SHM_NAME);
+
+        printf("[Parent] Done. Cleaned up shared memory and semaphores.\n");
+    }
+
+    return 0;
+}
